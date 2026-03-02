@@ -6,8 +6,17 @@ Standalone MCP server for Search CAIE past-paper search.
 
 - Core search tools for single-topic and multi-topic queries
 - Filters for subject, paper, year, session, chapter, mode, and pagination
-- Batch question fetch with full mark scheme details
-- Upstream retries and structured error payloads
+- LLM-friendly tool responses: concise text preview plus structured JSON
+- Multi-topic search returns `recommended_ids` for quick follow-up retrieval
+- `get_questions` supports both `compact` (default) and `full` detail modes
+- Backward-compatible inputs: comma-separated strings and native arrays
+- Upstream retries and structured error handling
+
+## Tool behavior notes
+
+- `search_multi` accepts either `topics` (comma-separated string) or `topics_list` (array)
+- `get_questions` accepts either `question_ids` (comma-separated string) or `question_ids_list` (array)
+- `get_questions` defaults to `detail="compact"` to reduce token usage and improve LLM answer quality
 
 ## Install
 

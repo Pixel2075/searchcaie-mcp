@@ -14,12 +14,15 @@ Default transport is stdio. For remote deployment, set:
 
 import logging
 import os
+import re
 import sys
 import time
 from typing import Any, Optional
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.tools.tool import ToolResult
 
 
 logging.basicConfig(
@@ -35,6 +38,9 @@ REQUEST_TIMEOUT = float(os.getenv("MCP_REQUEST_TIMEOUT", "30"))
 DEFAULT_SUBJECT = os.getenv("MCP_DEFAULT_SUBJECT", "9618")
 MAX_SEARCH_LIMIT = 50
 MAX_BATCH_IDS = 50
+MAX_TOPICS = 12
+DEFAULT_PREVIEW_LIMIT = 8
+MAX_RECOMMENDED_IDS = 20
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 
 
@@ -206,18 +212,36 @@ def _spell_correct(query: str) -> tuple[str, bool]:
 
 def _result_item(raw: dict[str, Any], index: int, matched_topics: Optional[list[str]] = None) -> dict[str, Any]:
     paper = raw.get("paper") or {}
+    session_short = _short_session(paper.get("session_name"))
+    paper_number = paper.get("paper_number")
+    year = paper.get("year")
+    variant = paper.get("variant")
+
+    paper_label_parts: list[str] = []
+    if paper_number is not None:
+        paper_label_parts.append(f"P{paper_number}")
+    if session_short and year is not None:
+        paper_label_parts.append(f"{session_short}{year}")
+    elif year is not None:
+        paper_label_parts.append(str(year))
+    if variant is not None:
+        paper_label_parts.append(f"v{variant}")
+
     item = {
         "rank": index,
         "id": raw.get("id"),
         "subject": paper.get("subject_code"),
-        "paper": paper.get("paper_number"),
-        "year": paper.get("year"),
+        "paper": paper_number,
+        "year": year,
         "session": paper.get("session_name"),
-        "session_short": _short_session(paper.get("session_name")),
-        "variant": paper.get("variant"),
+        "session_short": session_short,
+        "variant": variant,
+        "paper_label": " ".join(paper_label_parts),
         "question_number": raw.get("question_number"),
         "marks": raw.get("marks"),
         "relevance_score": raw.get("relevance_score"),
+        "relevance_tier": raw.get("relevance_tier"),
+        "duplicate_group_size": raw.get("duplicate_group_size"),
         "snippet": _clean_text(raw.get("question_text"), max_len=200),
     }
     if matched_topics:
@@ -229,7 +253,223 @@ def _validate_mode(mode: str) -> bool:
     return mode in {"hybrid", "keyword", "semantic"}
 
 
-@mcp.tool(title="Search Questions", tags={"search", "core"})
+def _normalize_topic_key(topic: str) -> str:
+    return re.sub(r"\s+", " ", (topic or "").strip().lower())
+
+
+def _to_ascii_text(value: Any, max_len: int = 500) -> str:
+    cleaned = _clean_text(value, max_len=max_len)
+    return cleaned.encode("ascii", errors="ignore").decode("ascii")
+
+
+def _parse_topics_input(topics: str, topics_list: Optional[list[str]]) -> list[str]:
+    merged: list[str] = []
+    if isinstance(topics, str) and topics.strip():
+        merged.extend(part.strip() for part in topics.split(",") if part.strip())
+    if topics_list:
+        merged.extend(str(part).strip() for part in topics_list if str(part).strip())
+
+    unique_topics: list[str] = []
+    seen: set[str] = set()
+    for topic in merged:
+        key = _normalize_topic_key(topic)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique_topics.append(topic)
+    return unique_topics
+
+
+def _parse_question_ids_input(question_ids: str, question_ids_list: Optional[list[int]]) -> list[int]:
+    parsed_ids: list[int] = []
+
+    if isinstance(question_ids, str) and question_ids.strip():
+        for part in question_ids.split(","):
+            value = part.strip()
+            if value:
+                parsed_ids.append(int(value))
+
+    if question_ids_list:
+        for value in question_ids_list:
+            parsed_ids.append(int(value))
+
+    unique_ids: list[int] = []
+    for qid in parsed_ids:
+        if qid not in unique_ids:
+            unique_ids.append(qid)
+    return unique_ids
+
+
+def _result_line(card: dict[str, Any]) -> str:
+    score_value = card.get("relevance_score")
+    score_text = f"{float(score_value):.3f}" if isinstance(score_value, (int, float)) else "n/a"
+    marks = card.get("marks")
+    marks_text = f"{marks}m" if marks is not None else "?m"
+    question_no = card.get("question_number") or "?"
+    return (
+        f"[{card.get('rank')}] ID:{card.get('id')} | {card.get('paper_label', '').strip()} | "
+        f"Q{question_no} | {marks_text} | score {score_text} | {card.get('snippet', '')}"
+    )
+
+
+def _build_search_summary(
+    *,
+    title: str,
+    query_note: Optional[str],
+    total: int,
+    returned: int,
+    cards: list[dict[str, Any]],
+    topic_lines: Optional[list[str]] = None,
+    recommended_ids: Optional[list[int]] = None,
+) -> str:
+    lines = [f"{title}: {total} found, showing {returned}."]
+    if query_note:
+        lines.append(query_note)
+
+    if topic_lines:
+        lines.append("Topic breakdown:")
+        lines.extend(topic_lines)
+
+    preview = cards[:DEFAULT_PREVIEW_LIMIT]
+    for card in preview:
+        lines.append(_result_line(card))
+
+    if len(cards) > len(preview):
+        lines.append(f"... {len(cards) - len(preview)} more results not shown in preview.")
+
+    if recommended_ids:
+        lines.append(f"Recommended IDs for next step: {', '.join(str(i) for i in recommended_ids)}")
+        lines.append(
+            "Next call: get_questions(question_ids_list=[...], detail='compact')"
+        )
+
+    return "\n".join(lines)
+
+
+def _extract_key_points(answer_text: Any, bullet_points: Any, max_points: int = 8) -> list[str]:
+    points: list[str] = []
+    seen_keys: set[str] = set()
+
+    if isinstance(bullet_points, list):
+        for bullet in bullet_points:
+            text = _to_ascii_text(bullet, max_len=220)
+            text = re.sub(r"\s+", " ", text).strip("-:;,. ")
+            key = text.lower()
+            if text and key not in seen_keys:
+                points.append(text)
+                seen_keys.add(key)
+            if len(points) >= max_points:
+                return points
+
+    text_blob = str(answer_text or "")
+    for raw_line in text_blob.splitlines():
+        line = _to_ascii_text(raw_line, max_len=220)
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+
+        lowered = line.lower()
+        if lowered.startswith("one mark per"):
+            continue
+        if lowered.startswith("one mark"):
+            continue
+        if lowered.startswith("two marks"):
+            continue
+        if lowered.startswith("three marks"):
+            continue
+        if lowered.startswith("max "):
+            continue
+        if re.match(r"^mp\d+\b", lowered):
+            continue
+        if lowered.startswith("mp") and len(line) <= 6:
+            continue
+
+        line = line.strip("-:;,. ")
+        if len(line) < 4:
+            continue
+        if line.startswith("/"):
+            continue
+
+        key = line.lower()
+        if key not in seen_keys:
+            points.append(line)
+            seen_keys.add(key)
+        if len(points) >= max_points:
+            break
+
+    return points
+
+
+def _select_recommended_ids(cards: list[dict[str, Any]], limit: int) -> list[int]:
+    selected: list[int] = []
+    covered_topics: set[str] = set()
+
+    for card in cards:
+        card_id = card.get("id")
+        if not isinstance(card_id, int):
+            continue
+
+        card_topics = [str(t) for t in (card.get("matched_topics") or [])]
+        unseen = [t for t in card_topics if t not in covered_topics]
+        if unseen and card_id not in selected:
+            selected.append(card_id)
+            covered_topics.update(unseen)
+            if len(selected) >= limit:
+                return selected[:limit]
+
+    for card in cards:
+        card_id = card.get("id")
+        if isinstance(card_id, int) and card_id not in selected:
+            selected.append(card_id)
+            if len(selected) >= limit:
+                break
+
+    return selected[:limit]
+
+
+def _build_questions_summary(
+    questions: list[dict[str, Any]],
+    missing_ids: list[int],
+    detail: str,
+) -> str:
+    lines = [f"Fetched {len(questions)} questions (detail={detail})."]
+    if missing_ids:
+        lines.append(f"Missing IDs: {', '.join(str(i) for i in missing_ids)}")
+
+    preview = questions[:4]
+    for q in preview:
+        paper = q.get("paper") or {}
+        session_short = _short_session(paper.get("session_name"))
+        label_parts: list[str] = []
+        if paper.get("paper_number") is not None:
+            label_parts.append(f"P{paper.get('paper_number')}")
+        if session_short and paper.get("year") is not None:
+            label_parts.append(f"{session_short}{paper.get('year')}")
+        elif paper.get("year") is not None:
+            label_parts.append(str(paper.get("year")))
+        if paper.get("variant") is not None:
+            label_parts.append(f"v{paper.get('variant')}")
+        paper_label = " ".join(label_parts) if label_parts else "Unknown paper"
+        lines.append(
+            f"ID:{q.get('id')} | {paper_label} | Q{q.get('question_number')} | {q.get('marks', '?')}m"
+        )
+        lines.append(f"Q: {_to_ascii_text(q.get('question_text'), max_len=180)}")
+
+        key_points = q.get("key_points") or []
+        if key_points:
+            lines.append("Key points: " + "; ".join(str(p) for p in key_points[:5]))
+
+    if len(questions) > len(preview):
+        lines.append(f"... {len(questions) - len(preview)} more questions available in structured output.")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    title="Search Questions",
+    tags={"search", "core"},
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
 def search_questions(
     query: str,
     subject: Optional[str] = DEFAULT_SUBJECT,
@@ -241,17 +481,14 @@ def search_questions(
     limit: int = 20,
     offset: int = 0,
     expand: bool = True,
-) -> dict[str, Any]:
+) -> ToolResult:
     """Search past-paper questions with optional filters.
 
-    Returns structured and compact result cards. Use get_questions(question_ids)
-    to fetch full question text and mark schemes.
+    Returns compact ranked cards and structured IDs for follow-up retrieval.
     """
     if not _validate_mode(mode):
-        return _tool_error(
-            "INVALID_MODE",
-            "mode must be one of: hybrid, keyword, semantic",
-            details={"mode": mode},
+        raise ToolError(
+            "INVALID_MODE: mode must be one of 'hybrid', 'keyword', or 'semantic'."
         )
 
     capped_limit = max(1, min(limit, MAX_SEARCH_LIMIT))
@@ -284,7 +521,9 @@ def search_questions(
         data = _api_get("/search", params)
     except Exception as exc:
         logger.error("search_questions failed: %s", exc, exc_info=True)
-        return _error_from_exception(exc, "/search")
+        error_payload = _error_from_exception(exc, "/search")
+        message = error_payload.get("error", {}).get("message", "Search failed.")
+        raise ToolError(message)
 
     raw_results = data.get("results", []) if isinstance(data, dict) else []
     if not isinstance(raw_results, list):
@@ -292,9 +531,10 @@ def search_questions(
 
     visible_results = raw_results[:capped_limit]
     cards = [_result_item(r, i + 1) for i, r in enumerate(visible_results) if isinstance(r, dict)]
-    card_ids = [r["id"] for r in cards if r.get("id") is not None]
+    all_result_ids = [r["id"] for r in cards if isinstance(r.get("id"), int)]
+    recommended_ids = all_result_ids[: min(len(all_result_ids), MAX_RECOMMENDED_IDS)]
 
-    return {
+    payload = {
         "ok": True,
         "query": original_query,
         "effective_query": effective_query,
@@ -320,17 +560,40 @@ def search_questions(
             "api_base": API_BASE,
         },
         "results": cards,
+        "all_result_ids": all_result_ids,
+        "recommended_ids": recommended_ids,
         "next_step": {
             "tool": "get_questions",
-            "question_ids": card_ids[:15],
-            "example": "get_questions(question_ids='id1,id2,id3')",
+            "question_ids": recommended_ids[:15],
+            "question_ids_list": recommended_ids[:15],
+            "example": "get_questions(question_ids_list=[1615,1684], detail='compact')",
         },
     }
 
+    query_note = None
+    if was_corrected and effective_query != original_query:
+        query_note = f"Query corrected from '{original_query}' to '{effective_query}'."
 
-@mcp.tool(title="Search Multiple Topics", tags={"search", "core"})
+    summary_text = _build_search_summary(
+        title=f"Search results for '{original_query}'",
+        query_note=query_note,
+        total=payload["meta"]["api_total"],
+        returned=payload["meta"]["returned"],
+        cards=cards,
+        recommended_ids=recommended_ids[:15],
+    )
+
+    return ToolResult(content=summary_text, structured_content=payload)
+
+
+@mcp.tool(
+    title="Search Multiple Topics",
+    tags={"search", "core"},
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
 def search_multi(
-    topics: str,
+    topics: str = "",
+    topics_list: Optional[list[str]] = None,
     subject: Optional[str] = DEFAULT_SUBJECT,
     paper: Optional[int] = None,
     year: Optional[int] = None,
@@ -340,27 +603,22 @@ def search_multi(
     limit_per_topic: int = 10,
     max_results: int = 40,
     expand: bool = True,
-) -> dict[str, Any]:
-    """Search multiple comma-separated topics and deduplicate by question ID."""
+) -> ToolResult:
+    """Search multiple topics and deduplicate by question ID.
+
+    Accepts either `topics` (comma-separated string) or `topics_list`.
+    """
     if not _validate_mode(mode):
-        return _tool_error(
-            "INVALID_MODE",
-            "mode must be one of: hybrid, keyword, semantic",
-            details={"mode": mode},
+        raise ToolError(
+            "INVALID_MODE: mode must be one of 'hybrid', 'keyword', or 'semantic'."
         )
 
-    raw_topics = [t.strip() for t in topics.split(",") if t.strip()]
-    topic_list: list[str] = []
-    for t in raw_topics:
-        if t not in topic_list:
-            topic_list.append(t)
+    topic_list = _parse_topics_input(topics, topics_list)
 
     if not topic_list:
-        return _tool_error(
-            "NO_TOPICS",
-            "Provide one or more topics separated by commas.",
-            details={"topics": topics},
-        )
+        raise ToolError("NO_TOPICS: Provide one or more topics via topics or topics_list.")
+    if len(topic_list) > MAX_TOPICS:
+        raise ToolError(f"TOO_MANY_TOPICS: Maximum {MAX_TOPICS} topics per request.")
 
     capped_limit_per_topic = max(1, min(limit_per_topic, 30))
     capped_max_results = max(1, min(max_results, 100))
@@ -368,9 +626,29 @@ def search_multi(
 
     all_results: dict[int, dict[str, Any]] = {}
     topic_breakdown: list[dict[str, Any]] = []
+    effective_topics: list[str] = []
+    effective_seen: set[str] = set()
 
     for topic in topic_list:
         corrected_topic, was_corrected = _spell_correct(topic)
+        normalized_effective = _normalize_topic_key(corrected_topic)
+
+        if normalized_effective in effective_seen:
+            topic_breakdown.append(
+                {
+                    "topic": topic,
+                    "effective_topic": corrected_topic,
+                    "was_corrected": was_corrected,
+                    "api_returned": 0,
+                    "new_unique_results": 0,
+                    "skipped": "duplicate_effective_topic",
+                }
+            )
+            continue
+
+        effective_seen.add(normalized_effective)
+        effective_topics.append(corrected_topic)
+
         params: dict[str, Any] = {
             "q": corrected_topic,
             "mode": mode,
@@ -433,16 +711,21 @@ def search_multi(
     merged.sort(key=lambda x: float(x.get("relevance_score") or 0.0), reverse=True)
     visible = merged[:capped_max_results]
 
-    cards = []
+    cards: list[dict[str, Any]] = []
     for i, row in enumerate(visible, 1):
         matched_topics = sorted(list(row.get("_matched_topics", [])))
         cards.append(_result_item(row, i, matched_topics=matched_topics))
 
-    card_ids = [r["id"] for r in cards if r.get("id") is not None]
+    all_result_ids = [r["id"] for r in cards if isinstance(r.get("id"), int)]
+    recommended_ids = _select_recommended_ids(
+        cards,
+        limit=min(MAX_RECOMMENDED_IDS, len(all_result_ids)),
+    )
 
-    return {
+    payload = {
         "ok": True,
         "topics": topic_list,
+        "effective_topics": effective_topics,
         "filters": {
             "subject": subject,
             "paper": paper,
@@ -464,45 +747,88 @@ def search_multi(
         },
         "topic_breakdown": topic_breakdown,
         "results": cards,
+        "all_result_ids": all_result_ids,
+        "recommended_ids": recommended_ids,
         "next_step": {
             "tool": "get_questions",
-            "question_ids": card_ids[:20],
-            "example": "get_questions(question_ids='id1,id2,id3')",
+            "question_ids": recommended_ids,
+            "question_ids_list": recommended_ids,
+            "example": "get_questions(question_ids_list=[1615,1684], detail='compact')",
         },
     }
 
-
-@mcp.tool(title="Get Questions By IDs", tags={"search", "core"})
-def get_questions(question_ids: str) -> dict[str, Any]:
-    """Fetch full question details and mark schemes for comma-separated IDs."""
-    try:
-        parsed_ids = [int(x.strip()) for x in question_ids.split(",") if x.strip()]
-    except ValueError:
-        return _tool_error(
-            "INVALID_IDS",
-            "question_ids must be comma-separated integers, e.g. '552,799,866'.",
-            details={"question_ids": question_ids},
+    topic_lines: list[str] = []
+    for row in topic_breakdown:
+        if row.get("skipped"):
+            topic_lines.append(
+                f"- '{row.get('topic')}': skipped (duplicate of '{row.get('effective_topic')}')."
+            )
+            continue
+        if row.get("error"):
+            topic_lines.append(f"- '{row.get('topic')}': error ({row.get('error')}).")
+            continue
+        topic_lines.append(
+            f"- '{row.get('topic')}': {row.get('api_returned', 0)} found, "
+            f"{row.get('new_unique_results', 0)} unique"
         )
 
-    unique_ids: list[int] = []
-    for qid in parsed_ids:
-        if qid not in unique_ids:
-            unique_ids.append(qid)
+    summary_text = _build_search_summary(
+        title=f"Multi-topic search across {len(topic_list)} topics",
+        query_note=None,
+        total=payload["meta"]["unique_results_total"],
+        returned=payload["meta"]["returned"],
+        cards=cards,
+        topic_lines=topic_lines,
+        recommended_ids=recommended_ids,
+    )
+
+    return ToolResult(content=summary_text, structured_content=payload)
+
+
+@mcp.tool(
+    title="Get Questions By IDs",
+    tags={"search", "core"},
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+def get_questions(
+    question_ids: str = "",
+    question_ids_list: Optional[list[int]] = None,
+    detail: str = "compact",
+    max_key_points: int = 8,
+    include_images: bool = False,
+    include_ocr: bool = False,
+) -> ToolResult:
+    """Fetch question details and mark schemes for selected IDs.
+
+    Accepts either `question_ids` (comma-separated) or `question_ids_list`.
+    Default detail mode is `compact` for LLM-friendly responses.
+    """
+    if detail not in {"compact", "full"}:
+        raise ToolError("INVALID_DETAIL: detail must be 'compact' or 'full'.")
+
+    capped_points = max(1, min(max_key_points, 20))
+
+    try:
+        unique_ids = _parse_question_ids_input(question_ids, question_ids_list)
+    except (TypeError, ValueError):
+        raise ToolError(
+            "INVALID_IDS: Use integers only, e.g. question_ids='552,799' or question_ids_list=[552,799]."
+        )
 
     if not unique_ids:
-        return _tool_error("NO_IDS", "No question IDs provided.")
+        raise ToolError("NO_IDS: No question IDs were provided.")
     if len(unique_ids) > MAX_BATCH_IDS:
-        return _tool_error(
-            "TOO_MANY_IDS",
-            f"Too many IDs. Max {MAX_BATCH_IDS} per request.",
-            details={"provided": len(unique_ids), "max": MAX_BATCH_IDS},
+        raise ToolError(
+            f"TOO_MANY_IDS: Maximum {MAX_BATCH_IDS} IDs per request (received {len(unique_ids)})."
         )
 
     try:
         rows = _api_get("/questions/batch", {"ids": ",".join(str(x) for x in unique_ids)})
     except Exception as exc:
         logger.error("get_questions failed: %s", exc, exc_info=True)
-        return _error_from_exception(exc, "/questions/batch")
+        error_payload = _error_from_exception(exc, "/questions/batch")
+        message = error_payload.get("error", {}).get("message", "Question fetch failed.")
+        raise ToolError(message)
 
     if not isinstance(rows, list):
         rows = []
@@ -518,34 +844,67 @@ def get_questions(question_ids: str) -> dict[str, Any]:
         if not isinstance(bullets, list):
             bullets = []
 
+        key_points = _extract_key_points(
+            answer_text=row.get("answer_text"),
+            bullet_points=bullets,
+            max_points=capped_points,
+        )
+
+        base_payload = {
+            "id": row.get("id"),
+            "question_number": row.get("question_number"),
+            "question_text": row.get("question_text"),
+            "question_context": row.get("question_context"),
+            "marks": row.get("marks"),
+            "topic": row.get("topic"),
+            "chapter_id": row.get("chapter_id"),
+            "chapter_name": row.get("chapter_name"),
+            "subtopic": row.get("subtopic"),
+            "paper": {
+                "subject_code": paper.get("subject_code"),
+                "paper_number": paper.get("paper_number"),
+                "year": paper.get("year"),
+                "session_name": paper.get("session_name"),
+                "variant": paper.get("variant"),
+            },
+            "is_image_based": bool(row.get("is_image_based")),
+            "key_points": key_points,
+        }
+
+        if detail == "compact":
+            compact_payload = dict(base_payload)
+            compact_payload["question_text"] = _to_ascii_text(row.get("question_text"), max_len=550)
+            compact_payload["question_context"] = _to_ascii_text(
+                row.get("question_context"),
+                max_len=280,
+            )
+            compact_payload["answer_preview"] = _to_ascii_text(
+                row.get("answer_text"),
+                max_len=320,
+            )
+
+            if include_images:
+                compact_payload["image_path"] = row.get("image_path")
+                compact_payload["ms_image_path"] = row.get("ms_image_path")
+
+            if include_ocr:
+                compact_payload["ocr_text"] = _to_ascii_text(row.get("ocr_text"), max_len=500)
+
+            questions.append(compact_payload)
+            continue
+
         questions.append(
             {
-                "id": row.get("id"),
-                "question_number": row.get("question_number"),
-                "question_text": row.get("question_text"),
-                "question_context": row.get("question_context"),
-                "marks": row.get("marks"),
-                "topic": row.get("topic"),
-                "chapter_id": row.get("chapter_id"),
-                "chapter_name": row.get("chapter_name"),
-                "subtopic": row.get("subtopic"),
-                "paper": {
-                    "subject_code": paper.get("subject_code"),
-                    "paper_number": paper.get("paper_number"),
-                    "year": paper.get("year"),
-                    "session_name": paper.get("session_name"),
-                    "variant": paper.get("variant"),
-                },
+                **base_payload,
                 "answer_text": row.get("answer_text") or "",
                 "answer_bullet_points": bullets,
-                "is_image_based": bool(row.get("is_image_based")),
-                "image_path": row.get("image_path"),
-                "ms_image_path": row.get("ms_image_path"),
-                "ocr_text": row.get("ocr_text"),
+                "image_path": row.get("image_path") if include_images else None,
+                "ms_image_path": row.get("ms_image_path") if include_images else None,
+                "ocr_text": row.get("ocr_text") if include_ocr else None,
             }
         )
 
-    return {
+    payload = {
         "ok": True,
         "requested_ids": unique_ids,
         "meta": {
@@ -553,10 +912,21 @@ def get_questions(question_ids: str) -> dict[str, Any]:
             "found": len(questions),
             "missing": len(missing_ids),
             "api_base": API_BASE,
+            "detail": detail,
+            "include_images": include_images,
+            "include_ocr": include_ocr,
         },
         "missing_ids": missing_ids,
         "questions": questions,
     }
+
+    summary_text = _build_questions_summary(
+        questions=questions,
+        missing_ids=missing_ids,
+        detail=detail,
+    )
+
+    return ToolResult(content=summary_text, structured_content=payload)
 
 
 @mcp.tool(title="Get Database Stats", tags={"search", "core"})
@@ -654,7 +1024,7 @@ def exam_study_helper(topic: str, subject: str = DEFAULT_SUBJECT) -> str:
         f"Help me study '{topic}' for CAIE subject {subject}.\n\n"
         "Workflow:\n"
         f"1) Call search_questions(query='{topic}', subject='{subject}', expand=True).\n"
-        "2) Read IDs from results and call get_questions(question_ids='id1,id2,...').\n"
+        "2) Read recommended_ids and call get_questions(question_ids_list=[...], detail='compact').\n"
         "3) Explain recurring exam patterns and command words.\n"
         "4) Build a revision checklist and suggest practice order.\n\n"
         "When citing evidence, include subject, paper, year, session, variant, question number, and ID."
@@ -668,7 +1038,7 @@ def topic_deep_dive(topics: str, subject: str = DEFAULT_SUBJECT) -> str:
         f"Analyze how these topics are examined for CAIE subject {subject}: {topics}.\n\n"
         "Workflow:\n"
         f"1) Call search_multi(topics='{topics}', subject='{subject}', expand=True).\n"
-        "2) Call get_questions for top IDs.\n"
+        "2) Use recommended_ids and call get_questions(question_ids_list=[...], detail='compact').\n"
         "3) Summarize paper distribution, mark patterns, and recurring wording.\n"
         "4) Give exam-focused advice based on the evidence."
     )
