@@ -1,0 +1,11 @@
+{
+    "mcpServers": {
+        "searchcaie-search": {
+            "command": "searchcaie-mcp",
+            "env": {
+                "MCP_API_BASE": "https://api.searchcaie.qzz.io/api",
+                "MCP_DEFAULT_SUBJECT": "9618"
+            }
+        }
+    }
+}
