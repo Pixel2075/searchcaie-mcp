@@ -1059,7 +1059,7 @@ def search_examiner_reports(
     paper: Optional[int] = None,
     year: Optional[int] = None,
     limit: int = 5,
-) -> str:
+) -> ToolResult:
     """Search examiner report commentary for insights on a topic.
 
     Returns relevant text chunks from Cambridge examiner reports that reveal:
@@ -1111,7 +1111,7 @@ def search_web_context(
     query: str,
     subject: Optional[str] = DEFAULT_SUBJECT,
     num_results: int = 5,
-) -> str:
+) -> ToolResult:
     """Get educational web content on a topic to supplement exam questions.
 
     Returns curated explanatory text from trusted education sites.
@@ -1151,7 +1151,7 @@ def search_topic_images(
     query: str,
     subject: Optional[str] = DEFAULT_SUBJECT,
     num_images: int = 3,
-) -> str:
+) -> ToolResult:
     """Find educational diagrams and illustrations for a topic.
 
     Returns image URLs with descriptive labels from trusted educational sources.
