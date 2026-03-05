@@ -34,8 +34,10 @@ logger = logging.getLogger("mcp-searchcaie")
 
 
 API_BASE = os.getenv("MCP_API_BASE", "https://api.searchcaie.qzz.io/api").rstrip("/")
+IMAGE_BASE_URL = os.getenv("MCP_IMAGE_BASE_URL", "https://api.searchcaie.qzz.io/api/images")
 REQUEST_TIMEOUT = float(os.getenv("MCP_REQUEST_TIMEOUT", "30"))
 DEFAULT_SUBJECT = os.getenv("MCP_DEFAULT_SUBJECT", "9618")
+QUESTION_URL_BASE = "https://chat.searchcaie.qzz.io/question"
 MAX_SEARCH_LIMIT = 50
 MAX_BATCH_IDS = 50
 MAX_TOPICS = 12
@@ -47,13 +49,21 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 mcp = FastMCP(
     "searchcaie-search",
     instructions=(
-        "You are connected to Search CAIE past-paper search tools.\n\n"
-        "Recommended workflow:\n"
-        "1) Use search_questions for one query with filters.\n"
-        "2) Use search_multi for comma-separated multi-topic search.\n"
-        "3) Use get_questions for full question/mark-scheme details by IDs.\n"
-        "4) Cite subject, paper, year, session, variant, question number, and ID.\n\n"
-        "Tool outputs are structured for reliability; prefer those fields over guessing."
+        "You are connected to Search CAIE — a search engine for Cambridge International "
+        "A-Level Computer Science (9618) past papers, mark schemes, and examiner reports.\n\n"
+        "RECOMMENDED WORKFLOW:\n"
+        "1. search_questions(query) → find relevant past paper questions\n"
+        "2. get_questions(question_ids_list=[...]) → get full question + mark scheme + images\n"
+        "3. search_examiner_reports(query) → examiner insights on common mistakes\n"
+        "4. search_web_context(query) → external explanations for deeper understanding\n"
+        "5. search_topic_images(query) → supplementary diagrams if needed\n\n"
+        "CRITICAL RULES:\n"
+        "- ALWAYS cite: Paper, Year, Session, Variant, Question number, ID\n"
+        "- For image-based questions, reference question_image_url so student can see the diagram\n"
+        "- Use mark scheme key_points as the authoritative answer source\n"
+        "- topic_signal reveals exam frequency — highlight overdue/high-frequency topics\n"
+        "- Examiner reports reveal WHAT GETS MARKS — prioritize over generic explanations\n"
+        "- question_url links to the full question page for students to view\n"
     ),
 )
 
@@ -171,6 +181,18 @@ def _clean_text(value: Any, max_len: int = 220) -> str:
     return text
 
 
+def _to_image_url(path: Any) -> Optional[str]:
+    """Convert a local filesystem image path to a public URL."""
+    if not path:
+        return None
+    path_str = str(path)
+    # Extract just the filename from any path format
+    filename = path_str.replace("\\", "/").rsplit("/", 1)[-1]
+    if not filename:
+        return None
+    return f"{IMAGE_BASE_URL}/{filename}"
+
+
 def _short_session(session_name: Optional[str]) -> str:
     s = (session_name or "").strip().lower()
     if "may" in s:
@@ -227,23 +249,40 @@ def _result_item(raw: dict[str, Any], index: int, matched_topics: Optional[list[
     if variant is not None:
         paper_label_parts.append(f"v{variant}")
 
-    item = {
+    is_image_based = bool(raw.get("is_image_based"))
+
+    item: dict[str, Any] = {
         "rank": index,
         "id": raw.get("id"),
-        "subject": paper.get("subject_code"),
         "paper": paper_number,
         "year": year,
-        "session": paper.get("session_name"),
-        "session_short": session_short,
+        "session": session_short,
         "variant": variant,
         "paper_label": " ".join(paper_label_parts),
         "question_number": raw.get("question_number"),
         "marks": raw.get("marks"),
         "relevance_score": raw.get("relevance_score"),
-        "relevance_tier": raw.get("relevance_tier"),
-        "duplicate_group_size": raw.get("duplicate_group_size"),
         "snippet": _clean_text(raw.get("question_text"), max_len=200),
+        "is_image_based": is_image_based,
+        "question_url": f"{QUESTION_URL_BASE}/{raw.get('id')}" if raw.get("id") else None,
     }
+
+    # Include image URLs for image-based questions
+    if is_image_based:
+        item["question_image_url"] = _to_image_url(raw.get("image_path"))
+        item["ms_image_url"] = _to_image_url(raw.get("ms_image_path"))
+
+    # Curated topic intelligence: just the one-line signal
+    ti = raw.get("topic_intelligence")
+    if isinstance(ti, dict) and ti.get("signal"):
+        item["topic_signal"] = ti["signal"]
+
+    # Variant info: count + IDs only, not full copies
+    variants = raw.get("duplicate_variants", [])
+    if isinstance(variants, list) and len(variants) > 0:
+        item["variants_count"] = raw.get("duplicate_group_size", 1)
+        item["variant_ids"] = [v.get("id") for v in variants if isinstance(v, dict) and v.get("id")]
+
     if matched_topics:
         item["matched_topics"] = matched_topics
     return item
@@ -306,9 +345,10 @@ def _result_line(card: dict[str, Any]) -> str:
     marks = card.get("marks")
     marks_text = f"{marks}m" if marks is not None else "?m"
     question_no = card.get("question_number") or "?"
+    img_tag = " [IMG]" if card.get("is_image_based") else ""
     return (
         f"[{card.get('rank')}] ID:{card.get('id')} | {card.get('paper_label', '').strip()} | "
-        f"Q{question_no} | {marks_text} | score {score_text} | {card.get('snippet', '')}"
+        f"Q{question_no} | {marks_text} | score {score_text}{img_tag} | {card.get('snippet', '')}"
     )
 
 
@@ -484,7 +524,15 @@ def search_questions(
 ) -> ToolResult:
     """Search past-paper questions with optional filters.
 
-    Returns compact ranked cards and structured IDs for follow-up retrieval.
+    Returns ranked questions with compact metadata. Each result includes:
+    - Paper identification (paper, year, session, variant, paper_label)
+    - Question number, marks, relevance score
+    - Whether it's image-based (if so, question_image_url and ms_image_url are provided)
+    - topic_signal: exam frequency and importance summary
+    - question_url: link to full question page
+
+    NEXT STEP: Call get_questions(question_ids_list=[...]) with the recommended_ids
+    to get full question text, mark scheme key points, and images.
     """
     if not _validate_mode(mode):
         raise ToolError(
@@ -547,26 +595,20 @@ def search_questions(
             "chapter": chapter,
             "mode": mode,
             "expand": expand,
-            "has_answer": True,
             "limit": capped_limit,
             "offset": safe_offset,
         },
         "meta": {
-            "api_total": data.get("total", len(raw_results)) if isinstance(data, dict) else len(raw_results),
-            "api_returned": len(raw_results),
+            "total": data.get("total", len(raw_results)) if isinstance(data, dict) else len(raw_results),
             "returned": len(cards),
             "query_time_ms": data.get("query_time_ms") if isinstance(data, dict) else None,
-            "truncated": len(raw_results) > len(cards),
-            "api_base": API_BASE,
         },
         "results": cards,
-        "all_result_ids": all_result_ids,
         "recommended_ids": recommended_ids,
         "next_step": {
             "tool": "get_questions",
-            "question_ids": recommended_ids[:15],
             "question_ids_list": recommended_ids[:15],
-            "example": "get_questions(question_ids_list=[1615,1684], detail='compact')",
+            "example": "get_questions(question_ids_list=[1615,1684])",
         },
     }
 
@@ -577,7 +619,7 @@ def search_questions(
     summary_text = _build_search_summary(
         title=f"Search results for '{original_query}'",
         query_note=query_note,
-        total=payload["meta"]["api_total"],
+        total=payload["meta"]["total"],
         returned=payload["meta"]["returned"],
         cards=cards,
         recommended_ids=recommended_ids[:15],
@@ -734,7 +776,6 @@ def search_multi(
             "chapter": chapter,
             "mode": mode,
             "expand": expand,
-            "has_answer": True,
             "limit_per_topic": capped_limit_per_topic,
             "max_results": capped_max_results,
         },
@@ -742,18 +783,14 @@ def search_multi(
             "topics_searched": len(topic_list),
             "unique_results_total": len(merged),
             "returned": len(cards),
-            "truncated": len(merged) > len(cards),
-            "api_base": API_BASE,
         },
         "topic_breakdown": topic_breakdown,
         "results": cards,
-        "all_result_ids": all_result_ids,
         "recommended_ids": recommended_ids,
         "next_step": {
             "tool": "get_questions",
-            "question_ids": recommended_ids,
             "question_ids_list": recommended_ids,
-            "example": "get_questions(question_ids_list=[1615,1684], detail='compact')",
+            "example": "get_questions(question_ids_list=[1615,1684])",
         },
     }
 
@@ -798,10 +835,20 @@ def get_questions(
     include_images: bool = False,
     include_ocr: bool = False,
 ) -> ToolResult:
-    """Fetch question details and mark schemes for selected IDs.
+    """Fetch full question details and mark schemes for selected IDs.
 
     Accepts either `question_ids` (comma-separated) or `question_ids_list`.
-    Default detail mode is `compact` for LLM-friendly responses.
+    Default detail is `compact` for LLM-friendly responses.
+
+    Returns for each question:
+    - Full question text and context
+    - Key mark scheme points (authoritative answers)
+    - Paper identification
+    - question_url: link to full question page
+    - Image URLs (question_image_url, ms_image_url) for image-based questions
+
+    Use include_images=True to get image URLs for ALL questions (not just image-based).
+    Use include_ocr=True to get OCR text extracted from question images.
     """
     if detail not in {"compact", "full"}:
         raise ToolError("INVALID_DETAIL: detail must be 'compact' or 'full'.")
@@ -857,19 +904,23 @@ def get_questions(
             "question_context": row.get("question_context"),
             "marks": row.get("marks"),
             "topic": row.get("topic"),
-            "chapter_id": row.get("chapter_id"),
             "chapter_name": row.get("chapter_name"),
             "subtopic": row.get("subtopic"),
             "paper": {
-                "subject_code": paper.get("subject_code"),
                 "paper_number": paper.get("paper_number"),
                 "year": paper.get("year"),
-                "session_name": paper.get("session_name"),
+                "session": _short_session(paper.get("session_name")),
                 "variant": paper.get("variant"),
             },
             "is_image_based": bool(row.get("is_image_based")),
+            "question_url": f"{QUESTION_URL_BASE}/{row.get('id')}" if row.get("id") else None,
             "key_points": key_points,
         }
+
+        # Always include image URLs for image-based questions
+        if bool(row.get("is_image_based")):
+            base_payload["question_image_url"] = _to_image_url(row.get("image_path"))
+            base_payload["ms_image_url"] = _to_image_url(row.get("ms_image_path"))
 
         if detail == "compact":
             compact_payload = dict(base_payload)
@@ -883,9 +934,9 @@ def get_questions(
                 max_len=320,
             )
 
-            if include_images:
-                compact_payload["image_path"] = row.get("image_path")
-                compact_payload["ms_image_path"] = row.get("ms_image_path")
+            if include_images and not bool(row.get("is_image_based")):
+                compact_payload["question_image_url"] = _to_image_url(row.get("image_path"))
+                compact_payload["ms_image_url"] = _to_image_url(row.get("ms_image_path"))
 
             if include_ocr:
                 compact_payload["ocr_text"] = _to_ascii_text(row.get("ocr_text"), max_len=500)
@@ -893,16 +944,17 @@ def get_questions(
             questions.append(compact_payload)
             continue
 
-        questions.append(
-            {
-                **base_payload,
-                "answer_text": row.get("answer_text") or "",
-                "answer_bullet_points": bullets,
-                "image_path": row.get("image_path") if include_images else None,
-                "ms_image_path": row.get("ms_image_path") if include_images else None,
-                "ocr_text": row.get("ocr_text") if include_ocr else None,
-            }
-        )
+        full_payload = {
+            **base_payload,
+            "answer_text": row.get("answer_text") or "",
+            "answer_bullet_points": bullets,
+            "ocr_text": row.get("ocr_text") if include_ocr else None,
+        }
+        if include_images and not bool(row.get("is_image_based")):
+            full_payload["question_image_url"] = _to_image_url(row.get("image_path"))
+            full_payload["ms_image_url"] = _to_image_url(row.get("ms_image_path"))
+
+        questions.append(full_payload)
 
     payload = {
         "ok": True,
@@ -911,10 +963,7 @@ def get_questions(
             "requested": len(unique_ids),
             "found": len(questions),
             "missing": len(missing_ids),
-            "api_base": API_BASE,
             "detail": detail,
-            "include_images": include_images,
-            "include_ocr": include_ocr,
         },
         "missing_ids": missing_ids,
         "questions": questions,
@@ -1048,6 +1097,111 @@ def topic_deep_dive(topics: str, subject: str = DEFAULT_SUBJECT) -> str:
 
 # ── Enhanced Search Tools (API-proxied) ──────────────────────────────────────
 
+
+def _clean_examiner_chunk(text: str) -> str:
+    """Remove generic ER boilerplate preamble, keep only topic-specific commentary."""
+    if not text:
+        return ""
+
+    # Common boilerplate sections to skip past
+    skip_markers = [
+        "Comments on specific questions",
+        "Comment on specific questions",
+    ]
+    for marker in skip_markers:
+        idx = text.find(marker)
+        if idx >= 0:
+            # Start from after the marker line
+            after = text[idx + len(marker):]
+            stripped = after.lstrip("\n\r ")
+            if stripped:
+                text = stripped
+                break
+
+    # Strip remaining generic preamble phrases that add no value
+    boilerplate_starts = [
+        "Key messages\n",
+        "General comments\n",
+        "Candidates need to demonstrate a detailed study",
+        "Candidates are advised to answer each question",
+        "Candidates must always make sure",
+        "Candidates are further advised to make use",
+    ]
+    for bp in boilerplate_starts:
+        if text.startswith(bp):
+            # Find next paragraph
+            next_para = text.find("\n\n", len(bp))
+            if next_para > 0:
+                text = text[next_para:].lstrip("\n\r ")
+
+    # Clean up copyright lines
+    text = re.sub(r"©\s*\d{4}\s*$", "", text, flags=re.MULTILINE).strip()
+    return text
+
+
+def _extract_educational_content(content: str, max_chars: int = 800) -> str:
+    """Extract educational content from a web page scrape, stripping nav/ads/chrome."""
+    if not content:
+        return ""
+
+    # Remove common navigation/menu patterns
+    nav_patterns = [
+        r"(?i)(?:^|\n)\s*\*\s*(?:Courses|Tutorials|Interview Prep|Sign In|DSA Python|"
+        r"Interview Corner|Puzzles|Aptitude|System Design|Must Do|Quizzes|"
+        r"Interview Questions|DSA Tutorial|Data Types|Examples|Practice|"
+        r"Data Science|NumPy|Pandas|Django|Flask|Projects|Advanced DSA)\s*(?:\n|$)",
+        r"(?i)Open In App\s*\n",
+        r"(?i)Jump to content\s*\n",
+        r"\*\*\s*\n",  # Standalone bold markers
+        r"(?i)^\s*\d+\s+languages?\s*$",  # Language count lines
+        r"(?i)^\s*\*\s*(?:Español|فارسی|한국어|Italiano|עברית)\s*$",  # Other language links
+        r"(?i)Article Tags:.*$",
+        r"(?i)Comment\s*$",
+        r"(?i)Improve\s*$",
+        r"(?i)\d+\s*Likes?\s*$",
+        r"(?i)Like\s*$",
+        r"(?i)Report\s*$",
+        r"(?i)Suggest changes\s*$",
+        r"(?i)Last Updated\s*:\s*\d+\s+\w+,?\s*\d{4}",
+        r"(?i)geeksforgeeks\s*\n",
+    ]
+    cleaned = content
+    for pattern in nav_patterns:
+        cleaned = re.sub(pattern, "\n", cleaned, flags=re.MULTILINE)
+
+    # Collapse multiple blank lines
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    # Truncate to max_chars at a sentence boundary
+    if len(cleaned) > max_chars:
+        # Try to cut at sentence boundary
+        truncated = cleaned[:max_chars]
+        last_period = truncated.rfind(".")
+        last_newline = truncated.rfind("\n")
+        cut_at = max(last_period, last_newline)
+        if cut_at > max_chars * 0.5:
+            cleaned = truncated[:cut_at + 1].rstrip()
+        else:
+            cleaned = truncated.rstrip() + "..."
+
+    return cleaned
+
+
+def _clean_image_title(title: str) -> str:
+    """Clean image title by removing common prefixes/suffixes."""
+    if not title:
+        return ""
+    # Remove "File:" prefix common in Wikipedia
+    title = re.sub(r"^File:\s*", "", title)
+    # Remove file extensions
+    title = re.sub(r"\.(svg|png|jpg|jpeg|gif|webp)\s*", " ", title, flags=re.IGNORECASE)
+    # Remove " - Wikipedia" suffix
+    title = re.sub(r"\s*-\s*Wikipedia\s*$", "", title)
+    # Remove " - GeeksforGeeks" suffix
+    title = re.sub(r"\s*-\s*GeeksforGeeks\s*$", "", title)
+    return title.strip()
+
+
 @mcp.tool(
     title="Search Examiner Reports",
     tags={"search", "enhanced"},
@@ -1060,12 +1214,15 @@ def search_examiner_reports(
     year: Optional[int] = None,
     limit: int = 5,
 ) -> ToolResult:
-    """Search examiner report commentary for insights on a topic.
+    """Search Cambridge examiner report commentary for insights on how a topic is examined.
 
-    Returns relevant text chunks from Cambridge examiner reports that reveal:
-    - What examiners expect from students on a topic
+    Returns examiner observations including:
+    - What examiners expect in answers on this topic
     - Common mistakes candidates make
-    - How to properly approach and answer questions on this topic
+    - Tips for how to structure answers to gain full marks
+
+    Use AFTER searching questions to understand examiner expectations on the same topic.
+    Examiner reports are the most authoritative source for HOW to answer, not WHAT to answer.
     """
     params: dict[str, Any] = {"q": query, "limit": max(1, min(limit, 20))}
     if subject:
@@ -1082,23 +1239,48 @@ def search_examiner_reports(
         error_payload = _error_from_exception(exc, "/search/examiner-reports")
         raise ToolError(error_payload.get("error", {}).get("message", "ER search failed."))
 
-    chunks = data.get("results", []) if isinstance(data, dict) else []
+    raw_chunks = data.get("results", []) if isinstance(data, dict) else []
     total = data.get("total", 0) if isinstance(data, dict) else 0
 
-    lines = [f"Examiner Report Search: {total} chunks found for '{query}', showing {len(chunks)}."]
-    for i, chunk in enumerate(chunks, 1):
+    # De-duplicate near-identical chunks and strip boilerplate
+    seen_hashes: set[int] = set()
+    curated_chunks: list[dict[str, Any]] = []
+    for chunk in raw_chunks:
+        if not isinstance(chunk, dict):
+            continue
+        cleaned_text = _clean_examiner_chunk(chunk.get("chunk_text", ""))
+        if not cleaned_text or len(cleaned_text) < 20:
+            continue
+        text_hash = hash(cleaned_text[:200])
+        if text_hash in seen_hashes:
+            continue
+        seen_hashes.add(text_hash)
+        curated_chunks.append({
+            "year": chunk.get("year"),
+            "session": chunk.get("session_name"),
+            "paper": chunk.get("paper_number"),
+            "commentary": cleaned_text,
+            "relevance_score": chunk.get("relevance_score"),
+        })
+
+    lines = [f"Examiner Report Search: {total} total for '{query}', showing {len(curated_chunks)} unique."]
+    for i, chunk in enumerate(curated_chunks, 1):
         year_str = chunk.get("year", "?")
-        session = chunk.get("session_name", "?")
-        paper_num = chunk.get("paper_number")
+        session = chunk.get("session", "?")
+        paper_num = chunk.get("paper")
         paper_label = f"Paper {paper_num}" if paper_num else "General"
-        text = _clean_text(chunk.get("chunk_text", ""), max_len=300)
+        text = _clean_text(chunk.get("commentary", ""), max_len=350)
         lines.append(f"[{i}] {year_str} {session} | {paper_label}")
         lines.append(f"    {text}")
 
-    if not chunks:
+    if not curated_chunks:
         lines.append("No examiner report data found for this query.")
 
-    payload = {"ok": True, "query": query, "total": total, "returned": len(chunks), "results": chunks}
+    payload = {
+        "ok": True, "query": query, "total": total,
+        "returned": len(curated_chunks),
+        "results": curated_chunks,
+    }
     return ToolResult(content="\n".join(lines), structured_content=payload)
 
 
@@ -1112,10 +1294,13 @@ def search_web_context(
     subject: Optional[str] = DEFAULT_SUBJECT,
     num_results: int = 5,
 ) -> ToolResult:
-    """Get educational web content on a topic to supplement exam questions.
+    """Get educational web content to supplement CAIE exam explanations.
 
-    Returns curated explanatory text from trusted education sites.
-    Use this to understand concepts deeply before explaining to students.
+    Returns summarized content from trusted CS education sites.
+    Use when the student needs conceptual explanations beyond what mark schemes provide.
+
+    Web content is supplementary — always prioritize official CAIE mark scheme points first.
+    Returns: source title, URL, domain, and key educational content (max 800 chars per source).
     """
     params: dict[str, Any] = {
         "q": query,
@@ -1131,15 +1316,41 @@ def search_web_context(
         error_payload = _error_from_exception(exc, "/search/web-context")
         raise ToolError(error_payload.get("error", {}).get("message", "Web search failed."))
 
-    formatted = data.get("formatted", "") if isinstance(data, dict) else ""
     results = data.get("results", []) if isinstance(data, dict) else []
 
-    payload = {
-        "ok": True, "query": query, "returned": len(results),
-        "results": [{"title": r.get("title"), "url": r.get("url"), "domain": r.get("domain")} for r in results],
-    }
+    # De-duplicate by domain — keep only the most relevant per domain
+    seen_domains: set[str] = set()
+    curated_results: list[dict[str, Any]] = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        domain = r.get("domain", "")
+        if domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+        key_content = _extract_educational_content(r.get("content", ""), max_chars=800)
+        curated_results.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "domain": domain,
+            "key_content": key_content,
+        })
 
-    return ToolResult(content=formatted or "No web content found.", structured_content=payload)
+    # Build concise text summary
+    content_lines = [f"Web context for '{query}' from {len(curated_results)} sources:"]
+    for i, r in enumerate(curated_results, 1):
+        content_lines.append(f"\n[{i}] {r['title']} ({r['domain']})")
+        content_lines.append(r["key_content"])
+
+    if not curated_results:
+        content_lines.append("No web content found for this query.")
+
+    payload = {
+        "ok": True, "query": query,
+        "returned": len(curated_results),
+        "results": curated_results,
+    }
+    return ToolResult(content="\n".join(content_lines), structured_content=payload)
 
 
 @mcp.tool(
@@ -1152,9 +1363,16 @@ def search_topic_images(
     subject: Optional[str] = DEFAULT_SUBJECT,
     num_images: int = 3,
 ) -> ToolResult:
-    """Find educational diagrams and illustrations for a topic.
+    """Find educational diagrams and illustrations for a CAIE topic.
 
-    Returns image URLs with descriptive labels from trusted educational sources.
+    Returns external web images (Wikipedia, GFG diagrams) — NOT past paper images.
+    For actual question/mark scheme images, use get_questions with include_images=True.
+
+    Use this when:
+    - Student needs a visual explanation of a concept (e.g., "show me a binary tree diagram")
+    - Adding supplementary illustrations beyond what exam papers show
+
+    Returns: image URL, title, source domain.
     """
     params: dict[str, Any] = {
         "q": query,
@@ -1170,11 +1388,34 @@ def search_topic_images(
         error_payload = _error_from_exception(exc, "/search/images")
         raise ToolError(error_payload.get("error", {}).get("message", "Image search failed."))
 
-    formatted = data.get("formatted", "") if isinstance(data, dict) else ""
-    images = data.get("images", []) if isinstance(data, dict) else []
+    raw_images = data.get("images", []) if isinstance(data, dict) else []
 
-    payload = {"ok": True, "query": query, "returned": len(images), "images": images}
-    return ToolResult(content=formatted or "No images found.", structured_content=payload)
+    # Clean up image data
+    curated_images: list[dict[str, Any]] = []
+    for img in raw_images:
+        if not isinstance(img, dict):
+            continue
+        curated_images.append({
+            "url": img.get("url", ""),
+            "title": _clean_image_title(img.get("title", "")),
+            "source": img.get("source_domain", ""),
+        })
+
+    # Build concise text summary
+    content_lines = [f"Found {len(curated_images)} images for '{query}':"]
+    for i, img in enumerate(curated_images, 1):
+        content_lines.append(f"[{i}] {img['title']} — {img['source']}")
+        content_lines.append(f"    URL: {img['url']}")
+
+    if not curated_images:
+        content_lines.append("No images found for this query.")
+
+    payload = {
+        "ok": True, "query": query,
+        "returned": len(curated_images),
+        "images": curated_images,
+    }
+    return ToolResult(content="\n".join(content_lines), structured_content=payload)
 
 
 def main() -> None:
