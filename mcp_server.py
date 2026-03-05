@@ -380,7 +380,7 @@ def _build_search_summary(
     if recommended_ids:
         lines.append(f"Recommended IDs for next step: {', '.join(str(i) for i in recommended_ids)}")
         lines.append(
-            "Next call: get_questions(question_ids_list=[...], detail='compact')"
+            "Next call: get_questions(question_ids_list=[...]) — choose detail='compact' for typical use or 'full' if you need the complete answer text."
         )
 
     return "\n".join(lines)
@@ -476,7 +476,7 @@ def _build_questions_summary(
     if missing_ids:
         lines.append(f"Missing IDs: {', '.join(str(i) for i in missing_ids)}")
 
-    preview = questions[:4]
+    preview = questions[:10]
     for q in preview:
         paper = q.get("paper") or {}
         session_short = _short_session(paper.get("session_name"))
@@ -1390,16 +1390,28 @@ def search_topic_images(
 
     raw_images = data.get("images", []) if isinstance(data, dict) else []
 
-    # Clean up image data
+    # Clean up image data and filter problematic URLs
     curated_images: list[dict[str, Any]] = []
     for img in raw_images:
         if not isinstance(img, dict):
             continue
+            
+        url = img.get("url", "")
+        # Skip Wikipedia thumbnails as they often throw 429 or have CORS issues
+        if "wikimedia.org/wikipedia/commons/thumb" in url or "wikipedia.org" in url:
+            continue
+        # Skip SVGs as they don't render well in some markdown/chat clients
+        if url.lower().endswith(".svg"):
+            continue
+            
         curated_images.append({
-            "url": img.get("url", ""),
+            "url": url,
             "title": _clean_image_title(img.get("title", "")),
             "source": img.get("source_domain", ""),
         })
+
+        if len(curated_images) >= num_images:
+            break
 
     # Build concise text summary
     content_lines = [f"Found {len(curated_images)} images for '{query}':"]
