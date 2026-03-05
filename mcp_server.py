@@ -1044,6 +1044,139 @@ def topic_deep_dive(topics: str, subject: str = DEFAULT_SUBJECT) -> str:
     )
 
 
+
+
+# ── Enhanced Search Tools (API-proxied) ──────────────────────────────────────
+
+@mcp.tool(
+    title="Search Examiner Reports",
+    tags={"search", "enhanced"},
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+def search_examiner_reports(
+    query: str,
+    subject: Optional[str] = DEFAULT_SUBJECT,
+    paper: Optional[int] = None,
+    year: Optional[int] = None,
+    limit: int = 5,
+) -> str:
+    """Search examiner report commentary for insights on a topic.
+
+    Returns relevant text chunks from Cambridge examiner reports that reveal:
+    - What examiners expect from students on a topic
+    - Common mistakes candidates make
+    - How to properly approach and answer questions on this topic
+    """
+    params: dict[str, Any] = {"q": query, "limit": max(1, min(limit, 20))}
+    if subject:
+        params["subject"] = subject
+    if paper is not None:
+        params["paper"] = paper
+    if year is not None:
+        params["year"] = year
+
+    try:
+        data = _api_get("/search/examiner-reports", params)
+    except Exception as exc:
+        logger.error("search_examiner_reports failed: %s", exc)
+        error_payload = _error_from_exception(exc, "/search/examiner-reports")
+        raise ToolError(error_payload.get("error", {}).get("message", "ER search failed."))
+
+    chunks = data.get("results", []) if isinstance(data, dict) else []
+    total = data.get("total", 0) if isinstance(data, dict) else 0
+
+    lines = [f"Examiner Report Search: {total} chunks found for '{query}', showing {len(chunks)}."]
+    for i, chunk in enumerate(chunks, 1):
+        year_str = chunk.get("year", "?")
+        session = chunk.get("session_name", "?")
+        paper_num = chunk.get("paper_number")
+        paper_label = f"Paper {paper_num}" if paper_num else "General"
+        text = _clean_text(chunk.get("chunk_text", ""), max_len=300)
+        lines.append(f"[{i}] {year_str} {session} | {paper_label}")
+        lines.append(f"    {text}")
+
+    if not chunks:
+        lines.append("No examiner report data found for this query.")
+
+    payload = {"ok": True, "query": query, "total": total, "returned": len(chunks), "results": chunks}
+    return ToolResult(content="\n".join(lines), structured_content=payload)
+
+
+@mcp.tool(
+    title="Search Web Context",
+    tags={"search", "enhanced"},
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+def search_web_context(
+    query: str,
+    subject: Optional[str] = DEFAULT_SUBJECT,
+    num_results: int = 5,
+) -> str:
+    """Get educational web content on a topic to supplement exam questions.
+
+    Returns curated explanatory text from trusted education sites.
+    Use this to understand concepts deeply before explaining to students.
+    """
+    params: dict[str, Any] = {
+        "q": query,
+        "num_results": max(1, min(num_results, 10)),
+    }
+    if subject:
+        params["subject"] = subject
+
+    try:
+        data = _api_get("/search/web-context", params)
+    except Exception as exc:
+        logger.error("search_web_context failed: %s", exc)
+        error_payload = _error_from_exception(exc, "/search/web-context")
+        raise ToolError(error_payload.get("error", {}).get("message", "Web search failed."))
+
+    formatted = data.get("formatted", "") if isinstance(data, dict) else ""
+    results = data.get("results", []) if isinstance(data, dict) else []
+
+    payload = {
+        "ok": True, "query": query, "returned": len(results),
+        "results": [{"title": r.get("title"), "url": r.get("url"), "domain": r.get("domain")} for r in results],
+    }
+
+    return ToolResult(content=formatted or "No web content found.", structured_content=payload)
+
+
+@mcp.tool(
+    title="Search Topic Images",
+    tags={"search", "enhanced"},
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+def search_topic_images(
+    query: str,
+    subject: Optional[str] = DEFAULT_SUBJECT,
+    num_images: int = 3,
+) -> str:
+    """Find educational diagrams and illustrations for a topic.
+
+    Returns image URLs with descriptive labels from trusted educational sources.
+    """
+    params: dict[str, Any] = {
+        "q": query,
+        "num_images": max(1, min(num_images, 10)),
+    }
+    if subject:
+        params["subject"] = subject
+
+    try:
+        data = _api_get("/search/images", params)
+    except Exception as exc:
+        logger.error("search_topic_images failed: %s", exc)
+        error_payload = _error_from_exception(exc, "/search/images")
+        raise ToolError(error_payload.get("error", {}).get("message", "Image search failed."))
+
+    formatted = data.get("formatted", "") if isinstance(data, dict) else ""
+    images = data.get("images", []) if isinstance(data, dict) else []
+
+    payload = {"ok": True, "query": query, "returned": len(images), "images": images}
+    return ToolResult(content=formatted or "No images found.", structured_content=payload)
+
+
 def main() -> None:
     transport = os.getenv("MCP_TRANSPORT", "stdio").strip().lower()
     if transport in {"http", "streamable-http", "sse"}:
