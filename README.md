@@ -38,7 +38,7 @@ pip install "git+https://github.com/Pixel2075/searchcaie-mcp.git"
     "searchcaie-search": {
       "command": "searchcaie-mcp",
       "env": {
-        "MCP_API_BASE": "https://api.searchcaie.qzz.io/api",
+        "MCP_API_BASE": "https://api.searchcaie.com/api",
         "MCP_DEFAULT_SUBJECT": "9618"
       }
     }
@@ -48,7 +48,7 @@ pip install "git+https://github.com/Pixel2075/searchcaie-mcp.git"
 
 ## Environment variables
 
-- `MCP_API_BASE` (default: `https://api.searchcaie.qzz.io/api`)
+- `MCP_API_BASE` (default: `https://api.searchcaie.com/api`)
 - `MCP_DEFAULT_SUBJECT` (default: `9618`)
 - `MCP_REQUEST_TIMEOUT` (default: `30`)
 - `MCP_TRANSPORT` (default: `stdio`)

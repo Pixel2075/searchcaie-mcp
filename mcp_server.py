@@ -2,7 +2,7 @@
 
 This server is standalone and proxies to the deployed API.
 
-Default backend: https://api.searchcaie.qzz.io/api
+Default backend: https://api.searchcaie.com/api
 Override with: MCP_API_BASE
 
 Default transport is stdio. For remote deployment, set:
@@ -33,11 +33,11 @@ logging.basicConfig(
 logger = logging.getLogger("mcp-searchcaie")
 
 
-API_BASE = os.getenv("MCP_API_BASE", "https://api.searchcaie.qzz.io/api").rstrip("/")
-IMAGE_BASE_URL = os.getenv("MCP_IMAGE_BASE_URL", "https://api.searchcaie.qzz.io/api/images")
+API_BASE = os.getenv("MCP_API_BASE", "https://api.searchcaie.com/api").rstrip("/")
+IMAGE_BASE_URL = os.getenv("MCP_IMAGE_BASE_URL", "https://api.searchcaie.com/api/images")
 REQUEST_TIMEOUT = float(os.getenv("MCP_REQUEST_TIMEOUT", "30"))
 DEFAULT_SUBJECT = os.getenv("MCP_DEFAULT_SUBJECT", "9618")
-QUESTION_URL_BASE = "https://chat.searchcaie.qzz.io/question"
+QUESTION_URL_BASE = "https://searchcaie.com/question"
 MAX_SEARCH_LIMIT = 50
 MAX_BATCH_IDS = 50
 MAX_TOPICS = 12

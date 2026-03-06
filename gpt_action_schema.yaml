@@ -1,0 +1,556 @@
+openapi: 3.1.0
+info:
+  title: SearchCAIE API
+  description: |
+    Search Cambridge International A-Level Computer Science (9618) past papers.
+    
+    ## Workflow
+    1. Use /gpt/search to find relevant questions - returns compact cards with IDs
+    2. Use /gpt/questions with the IDs to get full question details including mark schemes
+    
+    ## Authentication
+    Requires OAuth 2.0 authentication. Sign in when prompted.
+  version: 1.0.0
+servers:
+  - url: https://api.searchcaie.com/api
+    description: Production server
+
+paths:
+  /gpt/search:
+    get:
+      operationId: searchQuestions
+      summary: Search past-paper questions
+      description: |
+        Search for exam questions by topic, subject, paper, year, or session.
+        Returns compact result cards with IDs for follow-up retrieval.
+      tags:
+        - Search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query (e.g., "RISC processor features", "database normalization")
+          example: RISC processor features
+        - name: subject
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "9618"
+          description: Subject code (e.g., 9618 for Computer Science)
+          example: "9618"
+        - name: paper
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 4
+          description: Paper number (1-4)
+          example: 3
+        - name: year
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 2020
+            maximum: 2030
+          description: Filter by year
+          example: 2024
+        - name: session
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by session (e.g., "May/June", "Oct/Nov", "Feb/March")
+          example: Oct/Nov
+        - name: chapter
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+          description: Filter by syllabus chapter number
+          example: 15
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [keyword, semantic, hybrid]
+            default: hybrid
+          description: Search mode - hybrid combines keyword and semantic search
+          example: hybrid
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 14
+          description: Maximum number of results to return
+          example: 14
+        - name: expand
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: Expand query with synonyms for better results
+          example: false
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/GPTSearchResult'
+                  all_result_ids:
+                    type: array
+                    items:
+                      type: integer
+                    description: All question IDs from search
+                  recommended_ids:
+                    type: array
+                    items:
+                      type: integer
+                    description: Top recommended question IDs for follow-up
+                  total:
+                    type: integer
+                    description: Total number of matching questions
+                  query_time_ms:
+                    type: integer
+                    description: Query execution time in milliseconds
+                  query:
+                    type: string
+                    description: Original search query
+                  was_corrected:
+                    type: boolean
+                    description: Whether query was spell-corrected
+                  effective_query:
+                    type: string
+                    description: Corrected query if spell correction was applied
+              example:
+                results:
+                  - rank: 1
+                    id: 1615
+                    paper_label: "P3 ON2022 v31"
+                    question_number: "10(a)"
+                    marks: 2
+                    relevance_score: 0.89
+                    relevance_tier: highly_relevant
+                    snippet: "Reduced Instruction Set Computers (RISC) and Complex..."
+                all_result_ids: [1615, 1684, 829, 2161]
+                recommended_ids: [1615, 1684]
+                total: 15
+                query_time_ms: 250
+                query: "RISC processor"
+                was_corrected: false
+
+  /gpt/questions:
+    get:
+      operationId: getQuestions
+      summary: Get question details by IDs
+      description: |
+        Fetch full question details including question text, mark scheme, and key points.
+        Use IDs from /gpt/search response.
+      tags:
+        - Questions
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Comma-separated question IDs from search results
+          example: "1615,1684,829"
+        - name: detail
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [compact, full]
+            default: compact
+          description: |
+            Response detail level:
+            - compact: truncated text, key points, answer preview (recommended)
+            - full: complete answer text and bullet points
+          example: compact
+        - name: include_ocr
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: Include OCR text for image-based questions
+          example: false
+        - name: max_key_points
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 8
+          description: Maximum number of key points to extract from answer
+          example: 8
+      responses:
+        '200':
+          description: Question details
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GPTQuestion'
+              example:
+                - id: 1615
+                  question_number: "10(a)"
+                  question_text: "Reduced Instruction Set Computers (RISC) and Complex..."
+                  marks: 2
+                  topic: "Hardware and Virtual Machines"
+                  chapter_id: 15
+                  chapter_name: "Hardware and Virtual Machines"
+                  paper:
+                    subject_code: "9618"
+                    paper_number: 3
+                    year: 2022
+                    session_name: "Oct/Nov"
+                    variant: 31
+                  is_image_based: true
+                  key_points:
+                    - "uses a smaller instruction set"
+                    - "uses single-cycle instructions"
+                  answer_preview: "Two marks for all five rows correct..."
+                  question_url: "https://searchcaie.com/question/1615"
+
+  /gpt/examiner-reports:
+    get:
+      operationId: searchExaminerReports
+      summary: Search examiner reports
+      description: |
+        Search Cambridge examiner report commentary to find common mistakes and what examiners expect for a specific topic.
+        Always use this after fetching questions to understand HOW to answer.
+      tags:
+        - Search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query
+        - name: subject
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "9618"
+          description: Subject code (e.g., 9618)
+        - name: paper
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Filter by paper number (1-4)
+        - name: year
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Filter by year
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 5
+      responses:
+        '200':
+          description: Examiner report results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  query:
+                    type: string
+                  total:
+                    type: integer
+                  returned:
+                    type: integer
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        year:
+                          type: integer
+                        session:
+                          type: string
+                        paper:
+                          type: integer
+                        commentary:
+                          type: string
+                        relevance_score:
+                          type: number
+
+  /gpt/web-context:
+    get:
+      operationId: searchWebContext
+      summary: Search web for educational context
+      description: |
+        Get educational web content to supplement CAIE exam explanations.
+        Returns summarized content from trusted CS education sites.
+      tags:
+        - Search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query
+        - name: subject
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "9618"
+        - name: num_results
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 5
+      responses:
+        '200':
+          description: Web search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  query:
+                    type: string
+                  returned:
+                    type: integer
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title:
+                          type: string
+                        url:
+                          type: string
+                        domain:
+                          type: string
+                        key_content:
+                          type: string
+
+  /gpt/images:
+    get:
+      operationId: searchTopicImages
+      summary: Find educational diagrams and illustrations
+      description: |
+        Returns external web images (e.g., diagrams). Do NOT use to fetch past paper questions.
+        Use for visual explanations of a concept.
+      tags:
+        - Search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query
+        - name: subject
+          in: query
+          required: false
+          schema:
+            type: string
+            default: "9618"
+        - name: num_images
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 3
+      responses:
+        '200':
+          description: Image search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  query:
+                    type: string
+                  returned:
+                    type: integer
+                  images:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        url:
+                          type: string
+                        title:
+                          type: string
+                        source:
+                          type: string
+
+components:
+  schemas:
+    GPTSearchResult:
+      type: object
+      description: Compact search result card
+      properties:
+        rank:
+          type: integer
+          description: Result ranking position
+        id:
+          type: integer
+          description: Unique question ID
+        paper_label:
+          type: string
+          description: Paper identification (e.g., "P3 ON2022 v31")
+        question_number:
+          type: string
+          description: Question number in paper
+        marks:
+          type: integer
+          description: Available marks
+        relevance_score:
+          type: number
+          format: float
+          description: Relevance score (0-1)
+        relevance_tier:
+          type: string
+          enum: [highly_relevant, related, all_matches]
+          description: Relevance tier classification
+        duplicate_group_size:
+          type: integer
+          description: Number of similar questions in group
+        snippet:
+          type: string
+          description: Truncated question text (max 180 chars)
+        topic_signal:
+          type: string
+          description: Curated signal indicating exam frequency and importance.
+
+    GPTQuestion:
+      type: object
+      description: Full question details
+      properties:
+        id:
+          type: integer
+          description: Unique question ID
+        question_number:
+          type: string
+          description: Question number in paper
+        question_text:
+          type: string
+          description: Full question text (truncated in compact mode)
+        question_context:
+          type: string
+          description: Additional context for the question
+        marks:
+          type: integer
+          description: Available marks for this question
+        topic:
+          type: string
+          description: Topic name
+        chapter_id:
+          type: integer
+          description: Syllabus chapter ID
+        chapter_name:
+          type: string
+          description: Chapter name
+        subtopic:
+          type: string
+          description: Subtopic name
+        paper:
+          $ref: '#/components/schemas/PaperInfo'
+        is_image_based:
+          type: boolean
+          description: Whether question is image-based (requires OCR)
+        question_image_url:
+          type: string
+          description: Public URL to the question image
+        ms_image_url:
+          type: string
+          description: Public URL to the mark scheme image
+        key_points:
+          type: array
+          items:
+            type: string
+          description: Extracted key points from mark scheme
+        answer_preview:
+          type: string
+          description: Truncated answer text (compact mode only)
+        answer_text:
+          type: string
+          description: Full answer text (full mode only)
+        answer_bullet_points:
+          type: array
+          items:
+            type: string
+          description: Mark scheme bullet points (full mode only)
+        question_url:
+          type: string
+          description: Frontend URL to view the full question with images
+          example: "https://searchcaie.com/question/1615"
+        ocr_text:
+          type: string
+          description: OCR text for image-based questions
+
+    PaperInfo:
+      type: object
+      description: Paper metadata
+      properties:
+        subject_code:
+          type: string
+          description: Subject code (e.g., "9618")
+        paper_number:
+          type: integer
+          description: Paper number (1-4)
+        year:
+          type: integer
+          description: Exam year
+        session_name:
+          type: string
+          description: Session (e.g., "Oct/Nov", "May/June")
+        variant:
+          type: integer
+          description: Paper variant number
+
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.searchcaie.com/oidc/auth
+          tokenUrl: https://auth.searchcaie.com/oidc/token
+          scopes:
+            openid: OpenID Connect scope
+            offline_access: Request refresh token
+
+security:
+  - OAuth2: [openid, offline_access]
