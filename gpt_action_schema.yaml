@@ -231,7 +231,7 @@ paths:
                     - "uses a smaller instruction set"
                     - "uses single-cycle instructions"
                   answer_preview: "Two marks for all five rows correct..."
-                  question_url: "https://searchcaie.com/question/1615"
+                  question_url: "https://www.searchcaie.com/question/1615"
 
   /gpt/examiner-reports:
     get:
@@ -516,7 +516,7 @@ components:
         question_url:
           type: string
           description: Frontend URL to view the full question with images
-          example: "https://searchcaie.com/question/1615"
+          example: "https://www.searchcaie.com/question/1615"
         ocr_text:
           type: string
           description: OCR text for image-based questions
