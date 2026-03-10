@@ -38,18 +38,20 @@ pip install "git+https://github.com/Pixel2075/searchcaie-mcp.git"
     "searchcaie-search": {
       "command": "searchcaie-mcp",
       "env": {
-        "MCP_API_BASE": "https://api.searchcaie.com/api",
-        "MCP_DEFAULT_SUBJECT": "9618"
+        "MCP_API_BASE": "https://api.searchcaie.com/api"
       }
     }
   }
 }
 ```
 
+`MCP_DEFAULT_SUBJECT` is optional. If omitted, the server does not apply a
+subject filter by default.
+
 ## Environment variables
 
 - `MCP_API_BASE` (default: `https://api.searchcaie.com/api`)
-- `MCP_DEFAULT_SUBJECT` (default: `9618`)
+- `MCP_DEFAULT_SUBJECT` (optional; if unset, no default subject filter is applied)
 - `MCP_REQUEST_TIMEOUT` (default: `30`)
 - `MCP_TRANSPORT` (default: `stdio`)
 - `MCP_HOST` (default: `127.0.0.1`)
@@ -59,5 +61,15 @@ pip install "git+https://github.com/Pixel2075/searchcaie-mcp.git"
 ## Run directly
 
 ```bash
+searchcaie-mcp
+```
+
+## Run as a remote MCP server
+
+```bash
+MCP_TRANSPORT=streamable-http \
+MCP_HOST=0.0.0.0 \
+MCP_PORT=8000 \
+MCP_PATH=/mcp \
 searchcaie-mcp
 ```

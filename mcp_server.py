@@ -36,7 +36,8 @@ logger = logging.getLogger("mcp-searchcaie")
 API_BASE = os.getenv("MCP_API_BASE", "https://api.searchcaie.com/api").rstrip("/")
 IMAGE_BASE_URL = os.getenv("MCP_IMAGE_BASE_URL", "https://api.searchcaie.com/api/images")
 REQUEST_TIMEOUT = float(os.getenv("MCP_REQUEST_TIMEOUT", "30"))
-DEFAULT_SUBJECT = os.getenv("MCP_DEFAULT_SUBJECT", "9618")
+_default_subject = os.getenv("MCP_DEFAULT_SUBJECT", "").strip()
+DEFAULT_SUBJECT = _default_subject or None
 QUESTION_URL_BASE = "https://www.searchcaie.com/question"
 MAX_SEARCH_LIMIT = 50
 MAX_BATCH_IDS = 50
@@ -50,7 +51,7 @@ mcp = FastMCP(
     "searchcaie-search",
     instructions=(
         "You are connected to Search CAIE — a search engine for Cambridge International "
-        "A-Level Computer Science (9618) past papers, mark schemes, and examiner reports.\n\n"
+        "A-Level past papers, mark schemes, and examiner reports.\n\n"
         "RECOMMENDED WORKFLOW:\n"
         "1. search_questions(query) → find relevant past paper questions\n"
         "2. get_questions(question_ids_list=[...]) → get full question + mark scheme + images\n"
@@ -59,6 +60,9 @@ mcp = FastMCP(
         "5. search_topic_images(query) → supplementary diagrams if needed\n\n"
         "CRITICAL RULES:\n"
         "- ALWAYS cite: Paper, Year, Session, Variant, Question number, ID\n"
+        "- Supported subject codes include 9618, 9700, 9702, 9708, and 9709 when indexed\n"
+        "- If the user clearly specifies a subject, pass the correct subject code in tool calls\n"
+        "- If the user does not specify a subject, do not assume a subject filter by default\n"
         "- For image-based questions, reference question_image_url so student can see the diagram\n"
         "- Use mark scheme key_points as the authoritative answer source\n"
         "- topic_signal reveals exam frequency — highlight overdue/high-frequency topics\n"

@@ -3,8 +3,7 @@
         "searchcaie-search": {
             "command": "searchcaie-mcp",
             "env": {
-                "MCP_API_BASE": "https://api.searchcaie.com/api",
-                "MCP_DEFAULT_SUBJECT": "9618"
+                "MCP_API_BASE": "https://api.searchcaie.com/api"
             }
         }
     }
